@@ -1,16 +1,16 @@
 #include <Wire.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ModbusMaster.h>
 
 #include "driver/uart.h" //? this include file from tools/sdk/include/*
-
 #include "esp32-hal-uart.c"
 
 #include "Arduino.h"
 #include "StackArray.h"
 #include "esp32-firmware.h"
 #include "esp32-uart.h"
-
+#include "REG_SDM120.h"
 
 TaskHandle_t statusLED;
 
@@ -24,6 +24,11 @@ int gblSerialCmdChecksum = 0;
 bool gblNewCmdReady = 0;
 int gblSerialIdleCounter = 0;
 
+
+// setup timer interrupt for send serial
+hw_timer_t *Timer0 = NULL;
+portMUX_TYPE timerMux0 = portMUX_INITIALIZER_UNLOCKED;
+
 uint8_t gbl1stCMDBuffer[SER_BUFFER_SIZE];
 uint8_t gbl2ndCMDBuffer[SER_BUFFER_SIZE];
 
@@ -33,6 +38,7 @@ int gblExtSerialCmdCounter = 0;
 bool gblNewExtCmdReady = 0;
 uint8_t cmd_highByte = 0;
 uint8_t cmd_lowByte = 0;
+uint16_t shortAddrDevice = 0;
 
 uint8_t gbl1stExtCMDBuffer[SER_BUFFER_SIZE];
 uint8_t gbl2ndExtCMDBuffer[SER_BUFFER_SIZE];
@@ -55,14 +61,71 @@ volatile int gblWaitZBResponseCounter = 0;
 
 int gblNetworkControl = 0; // 1 = datalog, 2 = ifttt, 3 = customURL
 char gblNetworkPacket[MAX_PAYLOAD_SIZE] = {0};
+
+
+int gblBeepDurationCounter = 0;
+volatile bool gblNeedToStartABeep = false;
+volatile bool gblTimeToStartBeep = false;
+volatile bool gblTimeToStopBeep = false;
+
 int gblAutoSwitchNWKCounter = 0;
 volatile bool gblTimeToCheckNWK = false;
 volatile bool gblTimeToSwitchNWK = false;
 
+char *cmdToCC;
 StackArray<uint8_t> gblBuffer;
 StackArray<uint8_t> gblInputStack;
 
 HardwareSerial zbSerial(2);
+HardwareSerial rs485Serial(0);
+
+
+ModbusMaster node;
+
+//! RS483 part
+float HexTofloat(uint32_t x) {
+  return (*(float*)&x);
+}
+
+uint32_t FloatTohex(float x) {
+  return (*(uint32_t*)&x);
+}
+//------------------------------------------------
+
+float Read_Meter_float(char addr , uint16_t  REG) {
+  float i = 0;
+  uint8_t j, result;
+  uint16_t data[2];
+  uint32_t value = 0;
+  node.begin(addr, Serial);
+  result = node.readInputRegisters (REG, 2); ///< Modbus function 0x04 Read Input Registers
+  delay(500);
+  if (result == node.ku8MBSuccess) {
+    for (j = 0; j < 2; j++)
+    {
+      data[j] = node.getResponseBuffer(j);
+    }
+    value = data[0];
+    value = value << 16;
+    value = value + data[1];
+    i = HexTofloat(value);
+    //Serial.println("Connec modbus Ok.");
+    return i;
+  } else {
+    Serial.print("Connec modbus fail. REG >>> ");
+    Serial.println(REG, HEX); // Debug
+    delay(1000); 
+    return 0;
+  }
+}
+
+void GET_METER() {     // Update read all data
+  delay(1000);                              // เคลียบัสว่าง 
+    for (char i = 0; i < Total_of_Reg ; i++){
+      DATA_METER [i] = Read_Meter_float(ID_meter, Reg_addr[i]);//แสกนหลายตัวตามค่า ID_METER_ALL=X
+    } 
+}
+//! End RS485 Part
 
 int count = 0;
 
@@ -76,6 +139,39 @@ void ledStatus(const int ledPin)
     digitalWrite(ledPin, LOW); // turn off the LED
     delay(500);
     //}
+}
+
+void beep()
+{
+    //? Disable beep from hereú
+    // this flag causes timer0 to sound the beeper
+    portENTER_CRITICAL(&timerMux0);
+    gblNeedToStartABeep = true;
+    portEXIT_CRITICAL(&timerMux0);
+}
+
+
+// * //////////////////////////////////////////////////////
+// *    10ms timer1 interrupt
+void IRAM_ATTR miscTimer()
+{
+    portENTER_CRITICAL_ISR(&timerMux0);
+
+    if (gblNeedToStartABeep)
+    {
+        if (gblBeepDurationCounter++ == 0)
+        {
+            gblTimeToStartBeep = true;
+        }
+        else if (gblBeepDurationCounter == BEEP_DURATION)
+        {
+            gblTimeToStopBeep = true;
+
+            gblBeepDurationCounter = 0;
+            gblNeedToStartABeep = false;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&timerMux0);
 }
 
 void receiveZBPkt()
@@ -94,27 +190,34 @@ void receiveZBPkt()
         
         clearExtCmdReadyFlag();
 
-        //int cmd = (cmd_highByte << 8) + (cmd_lowByte);
+        uint8_t cmd = (cmd_highByte << 8) + (cmd_lowByte);
 
+        Serial.print("cmd : ");
+        Serial.println(cmd);
         // //! actually cmdID = inZBPkt[0] and inZBPkt[1] but high byte always 0
-        // if (cmd_highByte == ZIGBEE_PACKET_TYPE)
-        // {
-        //      processZBPkt(cmd, inZBPkt);
-        // }
+        if (cmd_highByte == ZIGBEE_PACKET_TYPE)
+        {
+             processZBPkt(cmd, inZBPkt);
+        }
     }
 }
 
-void processZBPkt(int cmd, uint8_t *inZBPkt)
+void processZBPkt(uint8_t cmd, uint8_t *inZBPkt)
 {
     // โยนขึ้นเน็ต
     switch (cmd)
     {
     case RES_DEVICE_ANNOUCE:
+        //? inZBPkt[8] + inZBPkt[9] = ShortAddr   
+        shortAddrDevice = (inZBPkt[8] << 8 ) + (inZBPkt[9]);
+        Serial.print("shortAddrDevice : ");
+        Serial.println(shortAddrDevice);
         // xSemaphoreTake(regSemaphore, portMAX_DELAY);
         // gblDeviceRegister[REG_NODE_STATUS] = 1;
         // memcpy(gblDeviceRegister + REG_SHORT_ADDR, inZBPkt + 8, 2);
         // memcpy(gblDeviceRegister + REG_IEEE_ADDR, inZBPkt, 8);
         // xSemaphoreGive(regSemaphore);
+
         break;
 
     case RES_READATTR:
@@ -323,15 +426,20 @@ void doStatusLEDCoreStuff(void *parameter)
 
 void setup()
 {
-    //* RS485 serial communication
+    // //* RS485 serial communication
     Serial.begin(115200);
 
-    //* CC2530 zigbee communication
-    // Note the format for setting a serial port is as follows: Serial2.begin(baud-rate, protocol, RX pin, TX pin);
+    // //* CC2530 zigbee communication
+    // // Note the format for setting a serial port is as follows: Serial2.begin(baud-rate, protocol, RX pin, TX pin);
     zbSerial.begin(115200);
     setInterruptHandlerFunction(uart_2, zbSerialEvent); //
     uart_enable_rx_intr(UART_NUM_2);
     delay(10);
+
+    // Serial.begin(2400);
+    // Serial.println();
+    // Serial.println();
+    // Serial.println(F("****************RS485 RTU SDM120*******************"));
 
     //* start run led status task in core 0
     xTaskCreatePinnedToCore(
@@ -344,6 +452,7 @@ void setup()
         0);                   /* Core where the task should run */
 
     delay(100); // wait for gesture task started
+
 
 }
 
@@ -371,7 +480,15 @@ void loop()
     receiveZBPkt();
 
     while (Serial.available())
-    {
+    {   
         zbSerial.write(Serial.read());
+        beep(); 
     }
+    // GET_METER();
+    // Serial.println();
+    // Serial.print("Total Active Energy = "); 
+    // Serial.print(DATA_METER[5]);
+    // Serial.println(" kWh");
+    // delay(5000);
+
 }
