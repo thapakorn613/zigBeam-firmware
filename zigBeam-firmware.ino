@@ -15,6 +15,7 @@
 TaskHandle_t statusLED;
 
 const int ledPin = 2;
+int ledStatus = 0;
 int incomingByte = 0;
 
 int gblSerialState = SER_WAITING_FOR_1ST_HEADER;
@@ -23,7 +24,6 @@ int gblSerialCmdCounter = 0;
 int gblSerialCmdChecksum = 0;
 bool gblNewCmdReady = 0;
 int gblSerialIdleCounter = 0;
-
 
 // setup timer interrupt for send serial
 hw_timer_t *Timer0 = NULL;
@@ -38,7 +38,9 @@ int gblExtSerialCmdCounter = 0;
 bool gblNewExtCmdReady = 0;
 uint8_t cmd_highByte = 0;
 uint8_t cmd_lowByte = 0;
+
 uint16_t shortAddrDevice = 0;
+uint16_t source_addr = 0;
 
 uint8_t gbl1stExtCMDBuffer[SER_BUFFER_SIZE];
 uint8_t gbl2ndExtCMDBuffer[SER_BUFFER_SIZE];
@@ -48,9 +50,9 @@ int inByteLength = 0;
 int inExtLength = 0;
 
 uint8_t inByte;
-uint8_t *Buffer[64];
 uint8_t inByte_rx;
 
+String Buffer = "PERMITJOIN 255\n";
 // setup uart handler
 uart_t *uart_0 = &_uart_bus_array[UART_NUM_0];
 uart_t *uart_2 = &_uart_bus_array[UART_NUM_2];
@@ -61,7 +63,6 @@ volatile int gblWaitZBResponseCounter = 0;
 
 int gblNetworkControl = 0; // 1 = datalog, 2 = ifttt, 3 = customURL
 char gblNetworkPacket[MAX_PAYLOAD_SIZE] = {0};
-
 
 int gblBeepDurationCounter = 0;
 volatile bool gblNeedToStartABeep = false;
@@ -77,79 +78,82 @@ StackArray<uint8_t> gblBuffer;
 StackArray<uint8_t> gblInputStack;
 
 HardwareSerial zbSerial(2);
-HardwareSerial rs485Serial(0);
-
 
 ModbusMaster node;
 
 //! RS483 part
-float HexTofloat(uint32_t x) {
-  return (*(float*)&x);
+float HexTofloat(uint32_t x)
+{
+    return (*(float *)&x);
 }
 
-uint32_t FloatTohex(float x) {
-  return (*(uint32_t*)&x);
+uint32_t FloatTohex(float x)
+{
+    return (*(uint32_t *)&x);
 }
 //------------------------------------------------
 
-float Read_Meter_float(char addr , uint16_t  REG) {
-  float i = 0;
-  uint8_t j, result;
-  uint16_t data[2];
-  uint32_t value = 0;
-  node.begin(addr, Serial);
-  result = node.readInputRegisters (REG, 2); ///< Modbus function 0x04 Read Input Registers
-  delay(500);
-  if (result == node.ku8MBSuccess) {
-    for (j = 0; j < 2; j++)
+float Read_Meter_float(char addr, uint16_t REG)
+{
+    float i = 0;
+    uint8_t j, result;
+    uint16_t data[2];
+    uint32_t value = 0;
+    node.begin(addr, Serial);
+    result = node.readInputRegisters(REG, 2); ///< Modbus function 0x04 Read Input Registers
+    delay(500);
+    if (result == node.ku8MBSuccess)
     {
-      data[j] = node.getResponseBuffer(j);
+        for (j = 0; j < 2; j++)
+        {
+            data[j] = node.getResponseBuffer(j);
+        }
+        value = data[0];
+        value = value << 16;
+        value = value + data[1];
+        i = HexTofloat(value);
+        //Serial.println("Connec modbus Ok.");
+        return i;
     }
-    value = data[0];
-    value = value << 16;
-    value = value + data[1];
-    i = HexTofloat(value);
-    //Serial.println("Connec modbus Ok.");
-    return i;
-  } else {
-    Serial.print("Connec modbus fail. REG >>> ");
-    Serial.println(REG, HEX); // Debug
-    delay(1000); 
-    return 0;
-  }
+    else
+    {
+        Serial.print("Connec modbus fail. REG >>> ");
+        Serial.println(REG, HEX); // Debug
+        delay(1000);
+        return 0;
+    }
 }
 
-void GET_METER() {     // Update read all data
-  delay(1000);                              // เคลียบัสว่าง 
-    for (char i = 0; i < Total_of_Reg ; i++){
-      DATA_METER [i] = Read_Meter_float(ID_meter, Reg_addr[i]);//แสกนหลายตัวตามค่า ID_METER_ALL=X
-    } 
+void GET_METER()
+{                // Update read all data
+    delay(1000); // เคลียบัสว่าง
+    for (char i = 0; i < Total_of_Reg; i++)
+    {
+        DATA_METER[i] = Read_Meter_float(ID_meter, Reg_addr[i]); //แสกนหลายตัวตามค่า ID_METER_ALL=X
+    }
 }
 //! End RS485 Part
 
 int count = 0;
 
-void ledStatus(const int ledPin)
+void toggleStatusLED()
 {
-    //if(turn == 1){
-    digitalWrite(ledPin, HIGH); // turn on the LED
-    delay(500);
-    //}
-    //else if (turn == 0) {
-    digitalWrite(ledPin, LOW); // turn off the LED
-    delay(500);
-    //}
+    digitalWrite(ledPin, ledStatus); // turn on the LED
+    ledStatus ^= 1;
 }
 
 void beep()
 {
-    //? Disable beep from hereú
+    //? Disable beep from here
     // this flag causes timer0 to sound the beeper
     portENTER_CRITICAL(&timerMux0);
     gblNeedToStartABeep = true;
     portEXIT_CRITICAL(&timerMux0);
 }
-
+void reportCmd()
+{
+    Serial.print("Report");
+}
 
 // * //////////////////////////////////////////////////////
 // *    10ms timer1 interrupt
@@ -180,24 +184,17 @@ void receiveZBPkt()
 
     if (newExtCmdPacketReady())
     {
-        Serial.println("int handler");
+        // Serial.print("int handler : ");
         inZBPkt = (newExtCmdPacketReady() == 1) ? gbl1stExtCMDBuffer : gbl2ndExtCMDBuffer;
         // inZBPkt เก็บตั้งแต่ไบร์ทที่ 6 ไป
-        for (int i = 0; i < inExtLength; i++)
-        {
-            Serial.println(inZBPkt[i]);
-        }
-        
+
         clearExtCmdReadyFlag();
 
         uint8_t cmd = (cmd_highByte << 8) + (cmd_lowByte);
-
-        Serial.print("cmd : ");
-        Serial.println(cmd);
         // //! actually cmdID = inZBPkt[0] and inZBPkt[1] but high byte always 0
         if (cmd_highByte == ZIGBEE_PACKET_TYPE)
         {
-             processZBPkt(cmd, inZBPkt);
+            processZBPkt(cmd, inZBPkt);
         }
     }
 }
@@ -205,11 +202,21 @@ void receiveZBPkt()
 void processZBPkt(uint8_t cmd, uint8_t *inZBPkt)
 {
     // โยนขึ้นเน็ต
+    Serial.print("Command Id : ");
+    Serial.println(cmd);
+    for (int i = 0; i < inExtLength; i++)
+    {
+        Serial.print(" ");
+        Serial.print(inZBPkt[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println("");
+
     switch (cmd)
     {
     case RES_DEVICE_ANNOUCE:
-        //? inZBPkt[8] + inZBPkt[9] = ShortAddr   
-        shortAddrDevice = (inZBPkt[8] << 8 ) + (inZBPkt[9]);
+        //? inZBPkt[8] + inZBPkt[9] = ShortAddr
+        shortAddrDevice = (inZBPkt[8] << 8) + (inZBPkt[9]);
         Serial.print("shortAddrDevice : ");
         Serial.println(shortAddrDevice);
         // xSemaphoreTake(regSemaphore, portMAX_DELAY);
@@ -217,7 +224,6 @@ void processZBPkt(uint8_t cmd, uint8_t *inZBPkt)
         // memcpy(gblDeviceRegister + REG_SHORT_ADDR, inZBPkt + 8, 2);
         // memcpy(gblDeviceRegister + REG_IEEE_ADDR, inZBPkt, 8);
         // xSemaphoreGive(regSemaphore);
-
         break;
 
     case RES_READATTR:
@@ -270,17 +276,31 @@ void processZBPkt(uint8_t cmd, uint8_t *inZBPkt)
         break;
 
     case RES_REPORT: // zigbee network
-        // int source_addr = (inZBPkt[0] << 8) + inZBPkt[1];
+        source_addr = uint16_t(inZBPkt[0] << 8) + inZBPkt[1];
+        // // // reportEndPoint = inZBPkt[2];
+        // // // reportClusterID = (inZBPkt[3] << 8) + inZBPkt[4];
+        // // // reportRegisterCount = inZBPkt[5];
+        Serial.print("source_addr : ");
+        Serial.println(source_addr);
 
+        // Serial.print(" , reportEndPoint : ");
+        // Serial.print(reportEndPoint);
+
+        // Serial.print(" , reportClusterID : ");
+        // Serial.print(reportClusterID);
+
+        // Serial.print(" , reportRegisterCount : ");
+        // Serial.println(reportRegisterCount);
         // if (inZBPkt[6] == NETWORK_REPORT_PACKET) // check packet type network report
         // {
-        //     int data_len;
-        //     data_len = (inZBPkt[9] << 8) + inZBPkt[10] + 4; // 2 payload size plus destination API & rest method
 
-        //     memcpy(gblNetworkPacket, inZBPkt + 7, data_len);
+        //     // int data_len;
+        //     // data_len = (inZBPkt[9] << 8) + inZBPkt[10] + 4; // 2 payload size plus destination API & rest method
 
-        //     // set flag destination API to trig nwk process
-        //     gblNetworkControl = inZBPkt[7];
+        //     // //memcpy(gblNetworkPacket, inZBPkt + 7, data_len);
+
+        //     // // set flag destination API to trig nwk process
+        //     // gblNetworkControl = inZBPkt[7];
         //     beep(); // debug receive network packet
         // }
         break;
@@ -420,7 +440,8 @@ void doStatusLEDCoreStuff(void *parameter)
 
     for (;;)
     {
-        ledStatus(ledPin);
+        toggleStatusLED();
+        delay(500);
     }
 }
 
@@ -445,15 +466,13 @@ void setup()
     xTaskCreatePinnedToCore(
         doStatusLEDCoreStuff, /* Function to implement the task */
         "StatusLEDTask",      /* Name of the task */
-        2048,                 /* Stack size in words */
+        1024,                 /* Stack size in words */
         NULL,                 /* Task input parameter */
-        2,                    /* Priority of the task */
+        1,                    /* Priority of the task */
         &statusLED,           /* Task handle. */
         0);                   /* Core where the task should run */
 
     delay(100); // wait for gesture task started
-
-
 }
 
 void loop()
@@ -480,15 +499,22 @@ void loop()
     receiveZBPkt();
 
     while (Serial.available())
-    {   
+    {
+        // if(Serial.read() == '1'){
+        //     int temp = zbSerial.write("PERMITJOIN 255");
+        //     zbSerial.write(temp);
+        // }
+        // else
+        // {
         zbSerial.write(Serial.read());
-        beep(); 
+        /* code */
+        // }
     }
+
     // GET_METER();
     // Serial.println();
-    // Serial.print("Total Active Energy = "); 
+    // Serial.print("Total Active Energy = ");
     // Serial.print(DATA_METER[5]);
     // Serial.println(" kWh");
     // delay(5000);
-
 }
